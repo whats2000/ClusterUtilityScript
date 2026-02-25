@@ -49,14 +49,44 @@ expand_nodelist() {
         || echo "$1"
 }
 
-get_job_nodes() {
+# Populates parallel arrays: JOB_IDS, JOB_NAMES, JOB_NODES (space-sep node list per job)
+declare -a  JOB_IDS=()
+declare -A  JOB_NAMES=()   # job_id -> name
+declare -A  JOB_NODES=()   # job_id -> newline-sep expanded node list
+declare -A  JOB_NODE_IDX=() # job_id -> current node cursor
+
+refresh_jobs() {
     local raw
-    raw=$(squeue --me --noheader --states=R --format="%N" 2>/dev/null)
-    [[ -z "$raw" ]] && return
-    while IFS= read -r nl; do
-        [[ -z "$nl" ]] && continue
-        expand_nodelist "$nl"
+    # Format: "JOBID NAME NODELIST"
+    raw=$(squeue --me --noheader --states=R --format="%i %j %N" 2>/dev/null)
+    [[ -z "$raw" ]] && { JOB_IDS=(); last_node_refresh=$(date +%s); return; }
+
+    local new_ids=()
+    declare -A new_names new_nodes
+
+    while read -r jid jname nl; do
+        [[ -z "$jid" ]] && continue
+        local expanded; expanded=$(expand_nodelist "$nl")
+        new_ids+=("$jid")
+        new_names[$jid]="$jname"
+        new_nodes[$jid]="$expanded"
+        # Start fetchers for each node in this job
+        while IFS= read -r n; do
+            [[ -n "$n" ]] && start_fetcher "$n"
+        done <<< "$expanded"
+        # Preserve existing node cursor for this job
+        [[ -z "${JOB_NODE_IDX[$jid]+x}" ]] && JOB_NODE_IDX[$jid]=0
     done <<< "$raw"
+
+    JOB_IDS=("${new_ids[@]}")
+    for k in "${!new_names[@]}"; do JOB_NAMES[$k]="${new_names[$k]}"; done
+    for k in "${!new_nodes[@]}"; do JOB_NODES[$k]="${new_nodes[$k]}"; done
+    last_node_refresh=$(date +%s)
+
+    # Clamp job cursor
+    local njobs=${#JOB_IDS[@]}
+    (( njobs > 0 && job_idx >= njobs )) && job_idx=$(( njobs - 1 ))
+    (( job_idx < 0 )) && job_idx=0
 }
 
 # ── Background fetcher (one per node, runs forever until killed) ──────────────
@@ -93,23 +123,7 @@ stop_all_fetchers() {
 }
 
 # ── Node list management ──────────────────────────────────────────────────────
-NODES=()
-total=0
 last_node_refresh=0
-
-refresh_nodes() {
-    local new_nodes=()
-    mapfile -t new_nodes < <(get_job_nodes)
-    last_node_refresh=$(date +%s)
-    # Start fetchers for any new nodes
-    for n in "${new_nodes[@]}"; do
-        start_fetcher "$n"
-    done
-    NODES=("${new_nodes[@]}")
-    total=${#NODES[@]}
-    (( total > 0 && cur_idx >= total )) && cur_idx=$(( total - 1 ))
-    (( cur_idx < 0 )) && cur_idx=0
-}
 
 # ── Rendering ─────────────────────────────────────────────────────────────────
 render_gpu_rows() {
@@ -134,10 +148,10 @@ render_gpu_rows() {
 }
 
 render_node() {
-    local node=$1 cur=$2 total=$3
+    local node=$1 node_cur=$2 node_total=$3 job_cur=$4 job_total=$5 jid=$6 jname=$7
     local now; now=$(date '+%H:%M:%S')
 
-    # Read cached data (may be empty on first call)
+    # Read cached data
     local cf; cf=$(cache_file "$node")
     local gpu_data=''
     [[ -f "$cf" ]] && gpu_data=$(cat "$cf")
@@ -151,9 +165,13 @@ render_node() {
         (( age > FETCH_INTERVAL * 3 )) && age_label="${YELLOW} [stale ${age}s]${RESET}"
     fi
 
-    printf "${BOLD}${CYAN}  %-30s${RESET}${age_label}" "$node"
-    printf "  ${DIM}[%d/%d]${RESET}  " "$cur" "$total"
-    printf "${DIM}%s  poll:%ss  < prev  next >  q quit${RESET}\n" "$now" "$FETCH_INTERVAL"
+    # Line 1: job info
+    printf "${DIM}  Job ${RESET}${BOLD}%-8s${RESET}${DIM} %-20s${RESET}" "$jid" "$jname"
+    printf "  ${DIM}job %d/%d  ↑↓ switch job${RESET}\n" "$job_cur" "$job_total"
+    # Line 2: node info
+    printf "${BOLD}${CYAN}  %-30s${RESET}${age_label}"
+    printf "  ${DIM}node [%d/%d]${RESET}  " "$node_cur" "$node_total"
+    printf "${DIM}%s  poll:%ss  < prev node  next node >  q quit${RESET}\n" "$now" "$FETCH_INTERVAL"
     printf "${DIM}%s${RESET}\n" "$(printf '─%.0s' $(seq 1 78))"
     printf "  ${BOLD}%-3s  %-22s  %4s  %-${BAR_WIDTH}s %-4s  %-${BAR_WIDTH}s %-14s${RESET}\n" \
            "GPU" "Name" "Temp" "  GPU Util" "%" "  Memory" "Used/Total MiB"
@@ -183,23 +201,40 @@ read_key() {
 }
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
-cur_idx=0
-refresh_nodes   # initial fetch + start all fetchers
+job_idx=0
+refresh_jobs   # initial fetch + start all fetchers
 
 while true; do
-    # Periodic node list refresh
+    # Periodic refresh
     now_ts=$(date +%s)
     if (( now_ts - last_node_refresh >= NODE_REFRESH_INTERVAL )); then
-        refresh_nodes
+        refresh_jobs
     fi
 
-    # Render current state (reads from cache — always instant)
-    if (( total == 0 )); then
+    njobs=${#JOB_IDS[@]}
+
+    if (( njobs == 0 )); then
         tput cup 0 0
         printf "\n  ${YELLOW}No running SLURM jobs found.${RESET}  (retrying…)\n"
         tput ed
     else
-        frame=$(render_node "${NODES[$cur_idx]}" $(( cur_idx + 1 )) "$total")
+        (( job_idx >= njobs )) && job_idx=$(( njobs - 1 ))
+        jid="${JOB_IDS[$job_idx]}"
+        jname="${JOB_NAMES[$jid]}"
+
+        # Build node list for current job, filter blanks
+        mapfile -t cur_nodes <<< "${JOB_NODES[$jid]}"
+        cur_nodes=($(printf '%s\n' "${cur_nodes[@]}" | grep -v '^[[:space:]]*$'))
+        ncount=${#cur_nodes[@]}
+
+        # Clamp node cursor for this job
+        nidx=${JOB_NODE_IDX[$jid]:-0}
+        (( nidx >= ncount )) && nidx=$(( ncount - 1 ))
+        (( nidx < 0 )) && nidx=0
+        JOB_NODE_IDX[$jid]=$nidx
+
+        node="${cur_nodes[$nidx]}"
+        frame=$(render_node "$node" $(( nidx+1 )) "$ncount" $(( job_idx+1 )) "$njobs" "$jid" "$jname")
         tput cup 0 0
         printf '%b' "$frame"
         tput ed
@@ -207,8 +242,27 @@ while true; do
 
     key=$(read_key)
     case "$key" in
-        $'\x1b[C'|'>'|'.' )   (( total > 0 )) && cur_idx=$(( (cur_idx + 1) % total )) ;;
-        $'\x1b[D'|'<'|',' )   (( total > 0 )) && cur_idx=$(( (cur_idx - 1 + total) % total )) ;;
-        'q'|'Q' )              cleanup ;;
+        $'\x1b[C'|'>'|'.' )   # → next node
+            if (( njobs > 0 )); then
+                jid="${JOB_IDS[$job_idx]}"
+                mapfile -t _nn <<< "${JOB_NODES[$jid]}"
+                _nn=($(printf '%s\n' "${_nn[@]}" | grep -v '^[[:space:]]*$'))
+                nc=${#_nn[@]}
+                JOB_NODE_IDX[$jid]=$(( (${JOB_NODE_IDX[$jid]:-0} + 1) % nc ))
+            fi ;;
+        $'\x1b[D'|'<'|',' )   # ← prev node
+            if (( njobs > 0 )); then
+                jid="${JOB_IDS[$job_idx]}"
+                mapfile -t _nn <<< "${JOB_NODES[$jid]}"
+                _nn=($(printf '%s\n' "${_nn[@]}" | grep -v '^[[:space:]]*$'))
+                nc=${#_nn[@]}
+                JOB_NODE_IDX[$jid]=$(( (${JOB_NODE_IDX[$jid]:-0} - 1 + nc) % nc ))
+            fi ;;
+        $'\x1b[A'|'k'|'K' )   # ↑ prev job
+            (( njobs > 0 )) && job_idx=$(( (job_idx - 1 + njobs) % njobs )) ;;
+        $'\x1b[B'|'j'|'J' )   # ↓ next job
+            (( njobs > 0 )) && job_idx=$(( (job_idx + 1) % njobs )) ;;
+        'q'|'Q' )
+            cleanup ;;
     esac
 done

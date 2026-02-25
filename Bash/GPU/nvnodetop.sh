@@ -205,7 +205,7 @@ render_gpu_section() {
     fi
 
     # Column header
-    printf "  ${BOLD}%-3s  %-18s  %4s  %-${bw}s %-3s  %-${bw}s %-12s  %-9s  %-10s  %-${HISTORY_LEN}s  %s${RESET}\n" \
+    printf "  ${BOLD}%-3s  %-18s  %5s  %-${bw}s %-4s  %-${bw}s %-12s  %-9s  %-10s  %-${HISTORY_LEN}s  %s${RESET}\n" \
            "GPU" "Name" "Temp" "Utilization" "%" "Memory" "Used/Tot MiB" "Power" "SM/MemMHz" "Util History" "Flags"
 
     # Accumulators for summary

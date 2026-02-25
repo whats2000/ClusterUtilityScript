@@ -1,34 +1,35 @@
 #!/bin/bash
-# GPU Monitor — per-node view, instant navigation via cached background fetchers
+# GPU Monitor — nvtop-inspired cluster view with background per-node caching
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; YELLOW='\033[0;33m'; GREEN='\033[0;32m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+MAGENTA='\033[0;35m'; WHITE='\033[1;37m'
 
 # ── Config ───────────────────────────────────────────────────────────────────
-FETCH_INTERVAL=${1:-3}    # seconds between GPU polls per node
-DISPLAY_INTERVAL=1        # display refresh rate (seconds, for read_key timeout)
-BAR_WIDTH=24
-NODE_REFRESH_INTERVAL=30  # seconds between squeue calls
+FETCH_INTERVAL=${1:-3}       # seconds between GPU polls per node
+DISPLAY_INTERVAL=1           # UI refresh rate
+BAR_WIDTH=16                 # narrower bars to fit power+clock columns
+NODE_REFRESH_INTERVAL=30     # seconds between squeue calls
 
-# ── Cache directory (auto-cleaned on exit) ───────────────────────────────────
+# ── Cache dir ────────────────────────────────────────────────────────────────
 CACHE_DIR=$(mktemp -d /tmp/gpu_mon_XXXXXX)
-declare -A FETCHER_PIDS   # node -> background loop PID
+declare -A FETCHER_PIDS
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 get_color() {
     local p=$1
-    (( p >= 80 )) && printf '%s' "$RED"  && return
-    (( p >= 50 )) && printf '%s' "$YELLOW" && return
+    (( p >= 85 )) && printf '%s' "$RED"    && return
+    (( p >= 60 )) && printf '%s' "$YELLOW" && return
     printf '%s' "$GREEN"
 }
 
 draw_bar() {
-    local pct=$1
+    local pct=$1 width=${2:-$BAR_WIDTH}
     (( pct < 0   )) && pct=0
     (( pct > 100 )) && pct=100
-    local filled=$(( pct * BAR_WIDTH / 100 ))
-    local empty=$(( BAR_WIDTH - filled ))
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
     local c; c=$(get_color "$pct")
     printf '%s' "$c"
     (( filled > 0 )) && printf '█%.0s' $(seq 1 "$filled")
@@ -39,42 +40,33 @@ draw_bar() {
 
 trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"; printf '%s' "$v"; }
 
-cache_file() { printf '%s/%s' "$CACHE_DIR" "${1//\//_}"; }
+cache_file() { printf '%s/%s'     "$CACHE_DIR" "${1//\//_}"; }
 age_file()   { printf '%s/%s.age' "$CACHE_DIR" "${1//\//_}"; }
 
-# ── SLURM helpers ─────────────────────────────────────────────────────────────
+# ── SLURM ─────────────────────────────────────────────────────────────────────
 expand_nodelist() {
     command -v scontrol &>/dev/null \
         && scontrol show hostnames "$1" 2>/dev/null \
         || echo "$1"
 }
 
-# Populates parallel arrays: JOB_IDS, JOB_NAMES, JOB_NODES (space-sep node list per job)
-declare -a  JOB_IDS=()
-declare -A  JOB_NAMES=()   # job_id -> name
-declare -A  JOB_NODES=()   # job_id -> newline-sep expanded node list
-declare -A  JOB_NODE_IDX=() # job_id -> current node cursor
+declare -a JOB_IDS=()
+declare -A JOB_NAMES=() JOB_NODES=() JOB_NODE_IDX=()
 
 refresh_jobs() {
     local raw
-    # Format: "JOBID NAME NODELIST"
     raw=$(squeue --me --noheader --states=R --format="%i %j %N" 2>/dev/null)
     [[ -z "$raw" ]] && { JOB_IDS=(); last_node_refresh=$(date +%s); return; }
 
     local new_ids=()
     declare -A new_names new_nodes
-
     while read -r jid jname nl; do
         [[ -z "$jid" ]] && continue
         local expanded; expanded=$(expand_nodelist "$nl")
         new_ids+=("$jid")
         new_names[$jid]="$jname"
         new_nodes[$jid]="$expanded"
-        # Start fetchers for each node in this job
-        while IFS= read -r n; do
-            [[ -n "$n" ]] && start_fetcher "$n"
-        done <<< "$expanded"
-        # Preserve existing node cursor for this job
+        while IFS= read -r n; do [[ -n "$n" ]] && start_fetcher "$n"; done <<< "$expanded"
         [[ -z "${JOB_NODE_IDX[$jid]+x}" ]] && JOB_NODE_IDX[$jid]=0
     done <<< "$raw"
 
@@ -82,26 +74,48 @@ refresh_jobs() {
     for k in "${!new_names[@]}"; do JOB_NAMES[$k]="${new_names[$k]}"; done
     for k in "${!new_nodes[@]}"; do JOB_NODES[$k]="${new_nodes[$k]}"; done
     last_node_refresh=$(date +%s)
-
-    # Clamp job cursor
     local njobs=${#JOB_IDS[@]}
     (( njobs > 0 && job_idx >= njobs )) && job_idx=$(( njobs - 1 ))
     (( job_idx < 0 )) && job_idx=0
 }
 
-# ── Background fetcher (one per node, runs forever until killed) ──────────────
-# Writes atomically: query -> .tmp -> mv -> cache file
+# ── Background fetcher ────────────────────────────────────────────────────────
+# Single SSH call returns three sections separated by sentinel lines:
+#   GPU stats | ---PROCS--- | process list
 _node_fetcher_loop() {
     local node=$1
     local cf; cf=$(cache_file "$node")
-    local af; af=$(age_file  "$node")
+    local af; af=$(age_file   "$node")
     local tmp="${cf}.tmp"
     while true; do
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
-            "$node" \
-            "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu \
-             --format=csv,noheader,nounits 2>/dev/null" \
-            >"$tmp" 2>/dev/null \
+            "$node" '
+nvidia-smi \
+  --query-gpu=index,name,utilization.gpu,memory.used,memory.total,\
+temperature.gpu,power.draw,power.limit,clocks.sm,clocks.mem,\
+clocks_throttle_reasons.hw_thermal_slowdown,\
+clocks_throttle_reasons.hw_power_brake_slowdown,\
+ecc.errors.uncorrected.volatile.total \
+  --format=csv,noheader,nounits 2>/dev/null
+echo "---PROCS---"
+# Build uuid->index map then emit: idx,pid,mem_mib,user,name
+python3 -c "
+import subprocess, pwd
+umap={}
+for l in subprocess.check_output([\"nvidia-smi\",\"--query-gpu=index,gpu_uuid\",\"--format=csv,noheader,nounits\"]).decode().strip().splitlines():
+    i,u=l.split(\", \",1); umap[u.strip()]=i.strip()
+out=subprocess.check_output([\"nvidia-smi\",\"--query-compute-apps=gpu_uuid,pid,used_gpu_memory,process_name\",\"--format=csv,noheader,nounits\"]).decode().strip()
+if not out: exit()
+for l in out.splitlines():
+    parts=[p.strip() for p in l.split(\",\",3)]
+    if len(parts)<4: continue
+    uuid,pid,mem,pname=parts
+    idx=umap.get(uuid,\"?\")
+    try: user=pwd.getpwuid(int(pid) and __import__(\"os\").stat(f\"/proc/{pid}\").st_uid).pw_name
+    except: user=\"?\"
+    print(f\"{idx},{pid},{mem},{user},{pname}\")
+" 2>/dev/null
+' >"$tmp" 2>/dev/null \
         && mv -f "$tmp" "$cf" \
         && date +%s > "$af"
         sleep "$FETCH_INTERVAL"
@@ -110,53 +124,105 @@ _node_fetcher_loop() {
 
 start_fetcher() {
     local node=$1
-    [[ -n "${FETCHER_PIDS[$node]}" ]] && return   # already running
+    [[ -n "${FETCHER_PIDS[$node]}" ]] && return
     _node_fetcher_loop "$node" &
     FETCHER_PIDS[$node]=$!
 }
 
 stop_all_fetchers() {
-    for node in "${!FETCHER_PIDS[@]}"; do
-        kill "${FETCHER_PIDS[$node]}" 2>/dev/null
-    done
+    for node in "${!FETCHER_PIDS[@]}"; do kill "${FETCHER_PIDS[$node]}" 2>/dev/null; done
     FETCHER_PIDS=()
 }
 
-# ── Node list management ──────────────────────────────────────────────────────
+# ── State ─────────────────────────────────────────────────────────────────────
 last_node_refresh=0
+SHOW_PROCS=0   # toggled with 'p'
 
 # ── Rendering ─────────────────────────────────────────────────────────────────
-render_gpu_rows() {
-    local gpu_data=$1
-    if [[ -z "$gpu_data" ]]; then
-        printf "  ${DIM}Waiting for first data...${RESET}\n"
+render_gpu_section() {
+    local raw_gpu=$1
+
+    if [[ -z "$raw_gpu" ]]; then
+        printf "  ${DIM}Waiting for first data…${RESET}\n"
         return
     fi
-    while IFS=',' read -r idx name util mem_used mem_total temp; do
-        idx=$(trim "$idx"); name=$(trim "$name")
-        util=$(trim "$util"); mem_used=$(trim "$mem_used")
+
+    # Column header
+    printf "  ${BOLD}%-3s  %-18s  %4s  %-${BAR_WIDTH}s %-3s  %-${BAR_WIDTH}s %-12s  %-9s  %-12s  %s${RESET}\n" \
+           "GPU" "Name" "Temp" "Utilization" "%" "Memory" "Used/Tot MiB" "Power" "SM/Mem MHz" "Flags"
+
+    while IFS=',' read -r idx name util mem_used mem_total temp \
+                            pwr_draw pwr_limit clk_sm clk_mem \
+                            thr_therm thr_pwr ecc_unc; do
+        idx=$(trim "$idx");       name=$(trim "$name")
+        util=$(trim "$util");     mem_used=$(trim "$mem_used")
         mem_total=$(trim "$mem_total"); temp=$(trim "$temp")
+        pwr_draw=$(trim "$pwr_draw");   pwr_limit=$(trim "$pwr_limit")
+        clk_sm=$(trim "$clk_sm");       clk_mem=$(trim "$clk_mem")
+        thr_therm=$(trim "$thr_therm"); thr_pwr=$(trim "$thr_pwr")
+        ecc_unc=$(trim "$ecc_unc")
 
-        local mem_pct=0
+        # Strip decimal from power
+        pwr_draw=${pwr_draw%%.*}; pwr_limit=${pwr_limit%%.*}
+
+        local mem_pct=0 pwr_pct=0
         (( mem_total > 0 )) && mem_pct=$(( mem_used * 100 / mem_total ))
-        local uc mc; uc=$(get_color "$util"); mc=$(get_color "$mem_pct")
+        (( pwr_limit > 0 )) && pwr_pct=$(( pwr_draw  * 100 / pwr_limit ))
 
-        printf "  ${BOLD}%3s${RESET}  %-22.22s  ${CYAN}%3s°C${RESET}  " "$idx" "$name" "$temp"
-        draw_bar "$util";  printf " ${uc}%3d%%${RESET}  " "$util"
-        draw_bar "$mem_pct"; printf " ${mc}%5d${RESET}/${mem_total}\n" "$mem_used"
-    done <<< "$gpu_data"
+        local uc mc pc
+        uc=$(get_color "$util"); mc=$(get_color "$mem_pct"); pc=$(get_color "$pwr_pct")
+
+        # Flag string: throttle + ECC
+        local flags=''
+        [[ "$thr_therm" == *Active* && "$thr_therm" != *Not* ]] && flags+="${RED}!THERM${RESET} "
+        [[ "$thr_pwr"   == *Active* && "$thr_pwr"   != *Not* ]] && flags+="${YELLOW}!PWR${RESET} "
+        [[ -n "$ecc_unc" && "$ecc_unc" != "0" && "$ecc_unc" != "N/A" ]] \
+            && flags+="${MAGENTA}ECC:${ecc_unc}${RESET}"
+
+        printf "  ${BOLD}%3s${RESET}  %-18.18s  ${CYAN}%3s°C${RESET}  " "$idx" "$name" "$temp"
+        draw_bar "$util";    printf " ${uc}%3d%%${RESET}  " "$util"
+        draw_bar "$mem_pct"; printf " ${mc}%5d${RESET}/%-5d  " "$mem_used" "$mem_total"
+        printf "${pc}%3d${RESET}/${pwr_limit}W  " "$pwr_draw"
+        printf "${DIM}%4d/%-4d${RESET}  " "$clk_sm" "$clk_mem"
+        printf "%b\n" "$flags"
+    done <<< "$raw_gpu"
+}
+
+render_proc_section() {
+    local raw_procs=$1
+    printf "  ${DIM}%s${RESET}\n" "$(printf '·%.0s' $(seq 1 78))"
+    printf "  ${BOLD}%-3s  %-7s  %-12s  %-30s  %s${RESET}\n" \
+           "GPU" "PID" "User" "Command" "GPU Mem MiB"
+    if [[ -z "$raw_procs" ]]; then
+        printf "  ${DIM}  (no compute processes)${RESET}\n"
+        return
+    fi
+    while IFS=',' read -r idx pid mem user pname; do
+        idx=$(trim "$idx"); pid=$(trim "$pid"); mem=$(trim "$mem")
+        user=$(trim "$user"); pname=$(trim "$pname")
+        pname="${pname##*/}"   # basename only
+        printf "  ${BOLD}%3s${RESET}  %-7s  %-12.12s  %-30.30s  ${CYAN}%s${RESET}\n" \
+               "$idx" "$pid" "$user" "$pname" "$mem"
+    done <<< "$raw_procs"
 }
 
 render_node() {
     local node=$1 node_cur=$2 node_total=$3 job_cur=$4 job_total=$5 jid=$6 jname=$7
     local now; now=$(date '+%H:%M:%S')
 
-    # Read cached data
+    # Split cache into GPU and PROC sections
     local cf; cf=$(cache_file "$node")
-    local gpu_data=''
-    [[ -f "$cf" ]] && gpu_data=$(cat "$cf")
+    local raw_gpu='' raw_procs=''
+    if [[ -f "$cf" ]]; then
+        local content; content=$(cat "$cf")
+        raw_gpu="${content%%---PROCS---*}"
+        raw_procs="${content#*---PROCS---}"
+        raw_procs="${raw_procs#$'\n'}"   # strip leading newline
+        # Trim trailing newlines from gpu section
+        raw_gpu="${raw_gpu%$'\n'}"
+    fi
 
-    # Staleness indicator
+    # Staleness
     local age_label=''
     local af; af=$(age_file "$node")
     if [[ -f "$af" ]]; then
@@ -165,17 +231,22 @@ render_node() {
         (( age > FETCH_INTERVAL * 3 )) && age_label="${YELLOW} [stale ${age}s]${RESET}"
     fi
 
-    # Line 1: job info
-    printf "${DIM}  Job ${RESET}${BOLD}%-8s${RESET}${DIM} %-20s${RESET}" "$jid" "$jname"
-    printf "  ${DIM}job %d/%d  ↑↓ switch job${RESET}\n" "$job_cur" "$job_total"
-    # Line 2: node info
-    printf "${BOLD}${CYAN}  %-30s${RESET}${age_label}"
-    printf "  ${DIM}node [%d/%d]${RESET}  " "$node_cur" "$node_total"
-    printf "${DIM}%s  poll:%ss  < prev node  next node >  q quit${RESET}\n" "$now" "$FETCH_INTERVAL"
+    local proc_hint="${DIM}p procs${RESET}"
+    (( SHOW_PROCS )) && proc_hint="${BOLD}p procs${RESET}"
+
+    # Header
+    printf "${DIM}  Job ${RESET}${BOLD}%-8s${RESET} ${DIM}%-18s${RESET}" "$jid" "$jname"
+    printf "  ${DIM}job [%d/%d]  ↑↓ jobs${RESET}\n" "$job_cur" "$job_total"
+    printf "${BOLD}${CYAN}  %-30s${RESET}%b" "$node" "$age_label"
+    printf "  ${DIM}node [%d/%d]  < > nodes  %b  q quit  poll:%ss${RESET}\n" \
+           "$node_cur" "$node_total" "$proc_hint" "$FETCH_INTERVAL"
     printf "${DIM}%s${RESET}\n" "$(printf '─%.0s' $(seq 1 78))"
-    printf "  ${BOLD}%-3s  %-22s  %4s  %-${BAR_WIDTH}s %-4s  %-${BAR_WIDTH}s %-14s${RESET}\n" \
-           "GPU" "Name" "Temp" "  GPU Util" "%" "  Memory" "Used/Total MiB"
-    render_gpu_rows "$gpu_data"
+
+    render_gpu_section "$raw_gpu"
+
+    if (( SHOW_PROCS )); then
+        render_proc_section "$raw_procs"
+    fi
 }
 
 # ── Terminal setup ────────────────────────────────────────────────────────────
@@ -186,15 +257,13 @@ cleanup() {
     exit 0
 }
 trap cleanup INT TERM EXIT
-
 tput smcup; tput civis; stty -echo
 
 read_key() {
     local k
     IFS= read -r -s -n1 -t "$DISPLAY_INTERVAL" k
     if [[ $k == $'\x1b' ]]; then
-        local seq
-        IFS= read -r -s -n2 -t 0.1 seq
+        local seq; IFS= read -r -s -n2 -t 0.1 seq
         k="${k}${seq}"
     fi
     printf '%s' "$k"
@@ -202,14 +271,11 @@ read_key() {
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 job_idx=0
-refresh_jobs   # initial fetch + start all fetchers
+refresh_jobs
 
 while true; do
-    # Periodic refresh
     now_ts=$(date +%s)
-    if (( now_ts - last_node_refresh >= NODE_REFRESH_INTERVAL )); then
-        refresh_jobs
-    fi
+    (( now_ts - last_node_refresh >= NODE_REFRESH_INTERVAL )) && refresh_jobs
 
     njobs=${#JOB_IDS[@]}
 
@@ -222,19 +288,17 @@ while true; do
         jid="${JOB_IDS[$job_idx]}"
         jname="${JOB_NAMES[$jid]}"
 
-        # Build node list for current job, filter blanks
         mapfile -t cur_nodes <<< "${JOB_NODES[$jid]}"
         cur_nodes=($(printf '%s\n' "${cur_nodes[@]}" | grep -v '^[[:space:]]*$'))
         ncount=${#cur_nodes[@]}
 
-        # Clamp node cursor for this job
         nidx=${JOB_NODE_IDX[$jid]:-0}
         (( nidx >= ncount )) && nidx=$(( ncount - 1 ))
         (( nidx < 0 )) && nidx=0
         JOB_NODE_IDX[$jid]=$nidx
 
-        node="${cur_nodes[$nidx]}"
-        frame=$(render_node "$node" $(( nidx+1 )) "$ncount" $(( job_idx+1 )) "$njobs" "$jid" "$jname")
+        frame=$(render_node "${cur_nodes[$nidx]}" \
+                $(( nidx+1 )) "$ncount" $(( job_idx+1 )) "$njobs" "$jid" "$jname")
         tput cup 0 0
         printf '%b' "$frame"
         tput ed
@@ -262,6 +326,8 @@ while true; do
             (( njobs > 0 )) && job_idx=$(( (job_idx - 1 + njobs) % njobs )) ;;
         $'\x1b[B'|'j'|'J' )   # ↓ next job
             (( njobs > 0 )) && job_idx=$(( (job_idx + 1) % njobs )) ;;
+        'p'|'P' )
+            (( SHOW_PROCS = !SHOW_PROCS )) ;;
         'q'|'Q' )
             cleanup ;;
     esac

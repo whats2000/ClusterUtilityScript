@@ -1,0 +1,3 @@
+[submodule "Bash/GPU/nvnodetop"]
+	path = Bash/GPU/nvnodetop
+	url = https://github.com/whats2000/nvnodetop.git

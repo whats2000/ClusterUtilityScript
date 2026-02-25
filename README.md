@@ -6,9 +6,9 @@ A collection of useful bash scripts to enhance your cluster experience.
 
 ### GPU Monitor - nvnodetop
 
-A utility script that monitors the GPU usage of all nodes in a cluster and displays the information in a table. Check the [script](Bash/GPU/nvnodetop.sh) for more information.
+A utility script that monitors the GPU usage of all nodes in a cluster and displays the information in a table. Check the [script](Bash/GPU/nvnodetop/scripts/nvnodetop.sh) for more information.
 
-![nvnodetop](assets/nvnodetop.png)
+![nvnodetop](Bash/GPU/nvnodetop/images/nvnodetop.png)
 
 ## Getting Started
 

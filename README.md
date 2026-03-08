@@ -10,6 +10,10 @@ A utility script that monitors the GPU usage of all nodes in a cluster and displ
 
 ![nvnodetop](Bash/GPU/nvnodetop/images/nvnodetop.png)
 
+### File Transfer - verisync
+
+A utility script for interactive directory transfer with checksum verification over SSH. Check the [script](Bash/File/verisync/verisync.sh) for more information.
+
 ## Getting Started
 
 To use these scripts:
